@@ -14,6 +14,11 @@ import aiofiles
 import hashlib
 from pathlib import Path
 from tinytag import TinyTag
+from fastapi import FastAPI
+
+
+app = FastAPI()
+
 
 # ------------------- CONFIG -------------------
 load_dotenv()  # Load environment variables from .env file
