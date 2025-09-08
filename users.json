@@ -1,0 +1,47 @@
+[
+  {
+    "username": "teast",
+    "email": "terst@gmail.com",
+    "password": "$2b$12$ajndoQWhrS4U7DIt8VDtWOW04xRY8RI2Fi0pN/jG56cSYmID2C2yu"
+  },
+  {
+    "username": "prathiyuman",
+    "email": "prathiyuman@gmail.com",
+    "password": "$2b$12$SCp76fk4i18hNAMYBt2Gdeezq4r4WqR.jwVgWem.NNOwfRH3vAg1C"
+  },
+  {
+    "username": "shahil",
+    "email": "shahil@gmail.com",
+    "password": "$2b$12$zplGadA7GYfBwTeq6rzfOOJ4WT4PKIdkVt/bW3tGlPSqHfVYhuGkq"
+  },
+  {
+    "username": "arun",
+    "email": "arun@gmail.com",
+    "password": "$2b$12$aA9ZoO3hgKp1iQklQ50nBevlqDGjg1CyTRXKRiohffRA3YrZZnGSO",
+    "role": "musiclover"
+  },
+  {
+    "username": "gokul",
+    "email": "gokul@gmail.com",
+    "password": "$2b$12$EFXBDPal8UEanNoH7kgGUexNXRadWY.HfWX5cL3mAgubaK9uUAaoi",
+    "role": "musiclover"
+  },
+  {
+    "username": "elakkiya",
+    "email": "elakkiya@gmail.com",
+    "password": "$2b$12$bZtJfNGhRByuOyyMeFUvFeFDb17d7MyFWBsOK/1BrNaLkFX0YkNZS",
+    "role": "musiclover"
+  },
+  {
+    "username": "john123",
+    "email": "john@example.com",
+    "password": "$2b$12$qkSAUEZNTX9IpgLDQ0zi3OrfjItH5LdepnH14uQmHdIGuMI0UGS0.",
+    "role": "admin"
+  },
+  {
+    "username": "test",
+    "email": "test@example.com",
+    "password": "$2b$12$/rMm38XjTY14atPkNDyWvetcRdvX6ot4vzWjWexiZp6/GuB8DATja",
+    "role": "musiclover"
+  }
+]
