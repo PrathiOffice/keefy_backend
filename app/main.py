@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
@@ -14,15 +15,11 @@ import aiofiles
 import hashlib
 from pathlib import Path
 from tinytag import TinyTag
-from fastapi import FastAPI
 
+# Load environment variables
+load_dotenv()
 
-app = FastAPI()
-
-
-# ------------------- CONFIG -------------------
-load_dotenv()  # Load environment variables from .env file
-
+# Configuration
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
     raise ValueError("SECRET_KEY must be set in environment variables")
@@ -33,33 +30,44 @@ if not API_KEY:
     raise ValueError("API_KEY must be set in environment variables")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "musicapp")
-MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "app/media"))
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/app/media"))  # Use /app/media for Render
 
 # Ensure media directory exists
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Lifespan for global MongoDB connection
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.mongodb_client = AsyncIOMotorClient(
+        MONGO_URL,
+        uuidRepresentation="standard",
+        serverSelectionTimeoutMS=5000
+    )
+    app.database = app.mongodb_client[MONGO_DB_NAME]
+    print("MongoDB connected globally!")
+    yield
+    app.mongodb_client.close()
+    print("MongoDB disconnected.")
+
+# Create FastAPI app with lifespan
 app = FastAPI(
-    title="Music App API", 
-    version="2.0.0", 
+    lifespan=lifespan,
+    title="Music App API",
+    version="2.0.0",
     description="Secure Music Management API with Admin Controls",
     openapi_tags=[
         {"name": "Auth", "description": "User authentication and registration"},
         {"name": "Music", "description": "Music upload and retrieval (Admin upload only)"},
-        {"name": "Users", "description": "User management (Admin access for bulk)"}
+        {"name": "Users", "description": "User management (Admin access for bulk)"},
+        {"name": "Health", "description": "Health check endpoint"}
     ]
 )
 
-# MongoDB Init
-client = AsyncIOMotorClient(MONGO_URL, uuidRepresentation="standard", serverSelectionTimeoutMS=5000)
-db = client[MONGO_DB_NAME]
-
-# Initialize collections
-users_col = db["users"]
-music_col = db["music"]
-
-# ------------------- MODELS -------------------
+# Models
 class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, description="Unique username")
     email: EmailStr = Field(..., description="Valid email address")
@@ -98,8 +106,8 @@ class MusicResponse(BaseModel):
     description: Optional[str]
     uploaded_by: str
     uploaded_at: str
-    file_path: Optional[str] = None  # URL or path to audio file
-    image: Optional[str] = None  # Path to image
+    file_path: Optional[str] = None
+    image: Optional[str] = None
 
 class BulkMusicUploadResponse(BaseModel):
     msg: str
@@ -107,7 +115,7 @@ class BulkMusicUploadResponse(BaseModel):
     failed: List[dict]
     success_count: int
 
-# ------------------- UTILS -------------------
+# Utils
 async def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
     if x_api_key != API_KEY:
         raise HTTPException(
@@ -143,7 +151,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-    user = await users_col.find_one({"username": username})
+    user = await app.database["users"].find_one({"username": username})
     if not user:
         raise credentials_exception
     return user
@@ -153,54 +161,53 @@ async def require_admin(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return current_user
 
+from mutagen import File as MutagenFile
+
 async def extract_metadata_from_file(temp_file_path: str) -> dict:
-    """Extract metadata from audio file using tinytag."""
     try:
         tag = TinyTag.get(temp_file_path)
-        metadata = {
-            "name": tag.title or "",
-            "artist": tag.artist or "",
-            "music_director": tag.composer or "",  # Composer often maps to music director
-            "singer": tag.artist or "",  # Singer often same as artist; adjust if separate tag available
-            "genre": tag.genre or "",
-        }
-        # Extract front cover image if present
-        if tag.images and tag.images.front_cover:
-            image_path = MEDIA_DIR / f"{uuid.uuid4()}.jpg"
-            with open(image_path, "wb") as img_file:
-                img_file.write(tag.images.front_cover.data)
-            metadata["image"] = str(image_path.relative_to(MEDIA_DIR))
-        return metadata
+        if tag.title:
+            return {
+                "name": tag.title,
+                "artist": tag.artist or "",
+                "genre": tag.genre or ""
+            }
     except Exception as e:
-        print(f"Metadata extraction failed: {e}")
+        print(f"TinyTag failed: {e}")
+
+    # fallback
+    try:
+        audio = MutagenFile(temp_file_path)
+        return {
+            "name": audio.tags.get("TIT2").text[0] if "TIT2" in audio.tags else "",
+            "artist": audio.tags.get("TPE1").text[0] if "TPE1" in audio.tags else "",
+            "genre": audio.tags.get("TCON").text[0] if "TCON" in audio.tags else ""
+        }
+    except Exception as e:
+        print(f"Mutagen failed: {e}")
         return {}
 
+
 async def save_uploaded_file(upload_file: UploadFile, current_user: dict) -> tuple[str, dict]:
-    """Save uploaded audio file, extract metadata, and return file path and metadata."""
     file_extension = Path(upload_file.filename).suffix.lower()
     if file_extension not in ['.mp3', '.wav', '.flac', '.m4a']:
         raise HTTPException(status_code=400, detail="Unsupported file format. Only MP3, WAV, FLAC, M4A allowed.")
     
-    # Generate unique filename
     file_hash = hashlib.md5(f"{upload_file.filename}{current_user['username']}{datetime.utcnow().timestamp()}".encode()).hexdigest()
     filename = f"{file_hash}{file_extension}"
     file_path = MEDIA_DIR / filename
     
-    # Write file content
     async with aiofiles.open(file_path, 'wb') as buffer:
         content = await upload_file.read()
         await buffer.write(content)
     
-    # Extract metadata from the saved file
     metadata = await extract_metadata_from_file(str(file_path))
-    
     return str(file_path.relative_to(MEDIA_DIR)), metadata
 
-# ------------------- ROUTES -------------------
+# Routes
 @app.post("/register", response_model=dict, dependencies=[Depends(verify_api_key)], tags=["Auth"])
 async def register(user: UserRegister):
-    # Check for existing user
-    existing_user = await users_col.find_one({"$or": [{"username": user.username}, {"email": user.email}]})
+    existing_user = await app.database["users"].find_one({"$or": [{"username": user.username}, {"email": user.email}]})
     if existing_user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username or Email already exists")
 
@@ -212,19 +219,18 @@ async def register(user: UserRegister):
         "role": user.role,
         "created_at": datetime.utcnow()
     }
-    result = await users_col.insert_one(user_data)
+    result = await app.database["users"].insert_one(user_data)
     return {"msg": "User registered successfully", "user_id": str(result.inserted_id)}
 
 @app.post("/login", response_model=Token, dependencies=[Depends(verify_api_key)], tags=["Auth"])
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = await users_col.find_one({"$or": [{"username": form_data.username}, {"email": form_data.username}]})
-
+    user = await app.database["users"].find_one({"$or": [{"username": form_data.username}, {"email": form_data.username}]})
     if not user or not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     access_token = create_access_token(data={"sub": user["username"], "role": user["role"]})
     return {
-        "access_token": access_token, 
+        "access_token": access_token,
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
     }
@@ -239,11 +245,10 @@ async def get_user_data(current_user: dict = Depends(get_current_user)):
         created_at=current_user["created_at"].isoformat()
     )
 
-# ------------------- USERS -------------------
 @app.get("/users", response_model=List[UserResponse], dependencies=[Depends(verify_api_key), Depends(require_admin)], tags=["Users"])
 async def get_all_users(skip: int = 0, limit: int = 100):
     users = []
-    async for user in users_col.find({}, {"password": 0}).skip(skip).limit(limit).sort("created_at", -1):
+    async for user in app.database["users"].find({}, {"password": 0}).skip(skip).limit(limit).sort("created_at", -1):
         user_dict = dict(user)
         user_dict["id"] = str(user_dict.pop("_id"))
         user_dict["created_at"] = user_dict["created_at"].isoformat()
@@ -255,7 +260,7 @@ async def get_user(username: str, current_user: dict = Depends(get_current_user)
     if current_user["role"] != "admin" and current_user["username"] != username:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this user")
     
-    user = await users_col.find_one({"username": username}, {"password": 0})
+    user = await app.database["users"].find_one({"username": username}, {"password": 0})
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     
@@ -271,7 +276,7 @@ async def get_user_by_id(user_id: str):
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format")
     
-    user = await users_col.find_one({"_id": obj_id}, {"password": 0})
+    user = await app.database["users"].find_one({"_id": obj_id}, {"password": 0})
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     
@@ -280,13 +285,11 @@ async def get_user_by_id(user_id: str):
     user_dict["created_at"] = user_dict["created_at"].isoformat()
     return UserResponse(**user_dict)
 
-# ------------------- MUSIC -------------------
 @app.post("/music", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin)], tags=["Music"])
 async def upload_music(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    # Save file and extract metadata
     file_path, metadata = await save_uploaded_file(file, current_user)
     
     if not metadata.get("name"):
@@ -298,14 +301,14 @@ async def upload_music(
         "music_director": metadata["music_director"],
         "singer": metadata["singer"],
         "genre": metadata["genre"],
-        "description": "",  # Can be added later if needed
+        "description": "",
         "uploaded_by": current_user["username"],
         "uploaded_at": datetime.utcnow(),
         "file_path": file_path,
         "image": metadata.get("image")
     }
     
-    result = await music_col.insert_one(music_entry)
+    result = await app.database["music"].insert_one(music_entry)
     return {"msg": "Music uploaded successfully with extracted metadata", "music_id": str(result.inserted_id)}
 
 @app.post("/music/bulk", response_model=BulkMusicUploadResponse, dependencies=[Depends(verify_api_key), Depends(require_admin)], tags=["Music"])
@@ -333,7 +336,7 @@ async def upload_music_bulk(
         music_data_list.append(music_entry)
     
     try:
-        result = await music_col.insert_many(music_data_list, ordered=False)
+        result = await app.database["music"].insert_many(music_data_list, ordered=False)
         success_count = len(result.inserted_ids)
         return BulkMusicUploadResponse(
             msg=f"Bulk music upload completed successfully. {success_count} songs uploaded.",
@@ -351,7 +354,7 @@ async def get_music(skip: int = 0, limit: int = 50, genre: Optional[str] = None)
         query["genre"] = genre
     
     music_list = []
-    async for music in music_col.find(query).skip(skip).limit(limit).sort("uploaded_at", -1):
+    async for music in app.database["music"].find(query).skip(skip).limit(limit).sort("uploaded_at", -1):
         music_dict = dict(music)
         music_dict["id"] = str(music_dict.pop("_id"))
         music_dict["uploaded_at"] = music_dict["uploaded_at"].isoformat()
@@ -360,16 +363,13 @@ async def get_music(skip: int = 0, limit: int = 50, genre: Optional[str] = None)
 
 @app.get("/music/all", response_model=List[MusicResponse], dependencies=[Depends(verify_api_key)], tags=["Music"])
 async def get_all_music():
-    """Retrieve all songs in the music collection without pagination."""
     music_list = []
-    async for music in music_col.find({}).sort("uploaded_at", -1):
+    async for music in app.database["music"].find({}).sort("uploaded_at", -1):
         music_dict = dict(music)
         music_dict["id"] = str(music_dict.pop("_id"))
         music_dict["uploaded_at"] = music_dict["uploaded_at"].isoformat()
         music_list.append(MusicResponse(**music_dict))
-    if not music_list:
-        return []
-    return music_list
+    return music_list if music_list else []
 
 @app.get("/music/{music_id}", response_model=MusicResponse, dependencies=[Depends(verify_api_key)], tags=["Music"])
 async def get_music_by_id(music_id: str):
@@ -378,7 +378,7 @@ async def get_music_by_id(music_id: str):
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid music ID format")
 
-    music = await music_col.find_one({"_id": obj_id})
+    music = await app.database["music"].find_one({"_id": obj_id})
     if not music:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Music not found")
 
@@ -403,19 +403,13 @@ async def search_music(q: str, limit: int = 20):
     }
     
     music_list = []
-    async for music in music_col.find(query).limit(limit).sort("uploaded_at", -1):
+    async for music in app.database["music"].find(query).limit(limit).sort("uploaded_at", -1):
         music_dict = dict(music)
         music_dict["id"] = str(music_dict.pop("_id"))
         music_dict["uploaded_at"] = music_dict["uploaded_at"].isoformat()
         music_list.append(MusicResponse(**music_dict))
     return music_list
 
-# Health check endpoint
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {"status": "healthy", "database": MONGO_DB_NAME, "media_dir": str(MEDIA_DIR)}
-
-# Graceful shutdown
-@app.on_event("shutdown")
-async def shutdown_event():
-    client.close()
