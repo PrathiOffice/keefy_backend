@@ -281,32 +281,55 @@ async def get_user_by_id(user_id: str):
     return UserResponse(**user_dict)
 
 # ------------------- MUSIC -------------------
-@app.post("/music", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin)], tags=["Music"])
+@app.post(
+    "/music",
+    response_model=dict,
+    dependencies=[Depends(verify_api_key), Depends(require_admin)],
+    tags=["Music"]
+)
 async def upload_music(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
     # Save file and extract metadata
     file_path, metadata = await save_uploaded_file(file, current_user)
-    
-    if not metadata.get("name"):
-        raise HTTPException(status_code=400, detail="Could not extract song name from file metadata. Please provide manually.")
-    
+
+    # Fallback values for missing metadata
     music_entry = {
-        "name": metadata["name"],
-        "artist": metadata["artist"],
-        "music_director": metadata["music_director"],
-        "singer": metadata["singer"],
-        "genre": metadata["genre"],
-        "description": "",  # Can be added later if needed
+        "name": metadata.get("name") or Path(file.filename).stem,  # fallback to filename
+        "artist": metadata.get("artist") or "Unknown Artist",
+        "music_director": metadata.get("music_director") or None,
+        "singer": metadata.get("singer") or None,
+        "genre": metadata.get("genre") or None,
+        "description": "",
         "uploaded_by": current_user["username"],
         "uploaded_at": datetime.utcnow(),
         "file_path": file_path,
         "image": metadata.get("image")
     }
-    
+
+    # Find which metadata fields are missing
+    missing_metadata = [
+        field for field, value in {
+            "name": metadata.get("name"),
+            "artist": metadata.get("artist"),
+            "music_director": metadata.get("music_director"),
+            "singer": metadata.get("singer"),
+            "genre": metadata.get("genre"),
+        }.items() if not value
+    ]
+
+    # Save to DB
     result = await music_col.insert_one(music_entry)
-    return {"msg": "Music uploaded successfully with extracted metadata", "music_id": str(result.inserted_id)}
+
+    return {
+        "msg": "Music uploaded successfully",
+        "music_id": str(result.inserted_id),
+        "file_path": file_path,
+        "missing_metadata": missing_metadata  # tells you what needs manual update
+    }
+
+
 
 @app.post("/music/bulk", response_model=BulkMusicUploadResponse, dependencies=[Depends(verify_api_key), Depends(require_admin)], tags=["Music"])
 async def upload_music_bulk(
