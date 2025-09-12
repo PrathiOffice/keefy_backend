@@ -413,9 +413,15 @@ async def play_music(music_id: str):
     return FileResponse(path=file_path, media_type="audio/mpeg", filename=file_path.name)
 
 # ------------------- HEALTH -------------------
-@app.get("/health", tags=["Health"], dependencies=[Depends(verify_api_key)])
+@app.get("/health", tags=["Health"])
 async def health_check():
-    return {"status": "healthy", "database": MONGO_DB_NAME, "media_dir": str(MEDIA_DIR)}
+    return {
+        "status": "healthy",
+        "database": MONGO_DB_NAME,
+        "media_dir": str(MEDIA_DIR)
+    }
+
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
