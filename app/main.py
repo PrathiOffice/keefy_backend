@@ -15,6 +15,7 @@ import aiofiles
 import hashlib
 from pathlib import Path
 from tinytag import TinyTag
+from typing import List
 
 # ------------------- CONFIG -------------------
 load_dotenv()
@@ -28,6 +29,7 @@ MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "app/media"))
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Cached password context for performance
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -43,10 +45,26 @@ app = FastAPI(
 )
 
 # ------------------- DATABASE -------------------
-client = AsyncIOMotorClient(MONGO_URL, uuidRepresentation="standard", serverSelectionTimeoutMS=5000)
+client = AsyncIOMotorClient(
+    MONGO_URL,
+    uuidRepresentation="standard",
+    serverSelectionTimeoutMS=5000,
+    maxPoolSize=50,  # Connection pooling
+    minPoolSize=10
+)
 db = client[MONGO_DB_NAME]
 users_col = db["users"]
 music_col = db["music"]
+
+# Create indexes for faster queries
+async def init_db():
+    await users_col.create_index([("username", 1)], unique=True)
+    await users_col.create_index([("email", 1)], unique=True)
+    await music_col.create_index([("uploaded_by", 1)])
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
 
 # ------------------- MODELS -------------------
 class UserRegister(BaseModel):
@@ -76,14 +94,20 @@ class MusicCreate(BaseModel):
     artist: Optional[str]
     genre: Optional[str]
     description: Optional[str]
+    language: str = Field(..., min_length=1)
+    category: str = Field(..., min_length=1)
+    is_keefy_original: bool = Field(...)
 
 class MusicUpdate(BaseModel):
-    name: str
-    artist: str
+    name: str = Field(..., min_length=1)
+    artist: str = Field(..., min_length=1)
     music_director: Optional[str] = None
     singer: Optional[str] = None
-    genre: Optional[str] = None
+    genre: str = Field(..., min_length=1)
     description: Optional[str] = None
+    language: str = Field(..., min_length=1)
+    category: str = Field(..., min_length=1)
+    is_keefy_original: bool = Field(...)
 
 # ------------------- UTILS -------------------
 async def verify_api_key(x_api_key: str = Header(..., alias="x-api-key")):
@@ -130,30 +154,30 @@ async def extract_metadata_from_file(temp_file_path: str) -> dict:
     """Extract metadata from audio file using tinytag."""
     try:
         tag = TinyTag.get(temp_file_path)
-        metadata = {
-            "name": tag.title,
-            "artist": tag.artist,
-            "music_director": tag.composer,
-            "singer": tag.artist,
-            "genre": tag.genre
+        return {
+            "name": tag.title or "",
+            "artist": tag.artist or "",
+            "music_director": tag.composer or "",
+            "singer": tag.artist or "",
+            "genre": tag.genre or "",
         }
-        return metadata
     except Exception as e:
         print(f"Metadata extraction failed: {e}")
         return {}
 
 async def save_uploaded_file(upload_file: UploadFile, current_user: dict) -> tuple[str, dict]:
+    ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a"}
     file_extension = Path(upload_file.filename).suffix.lower()
-    if file_extension not in ['.mp3', '.wav', '.flac', '.m4a']:
-        raise HTTPException(status_code=400, detail="Unsupported file format. Only MP3, WAV, FLAC, M4A allowed.")
+    if file_extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file format. Only {', '.join(ALLOWED_EXTENSIONS)} allowed.")
 
     file_hash = hashlib.md5(f"{upload_file.filename}{current_user['username']}{datetime.utcnow().timestamp()}".encode()).hexdigest()
     filename = f"{file_hash}{file_extension}"
     file_path = MEDIA_DIR / filename
 
     async with aiofiles.open(file_path, 'wb') as buffer:
-        content = await upload_file.read()
-        await buffer.write(content)
+        while content := await upload_file.read(1024 * 1024):  # Read in 1MB chunks
+            await buffer.write(content)
 
     metadata = await extract_metadata_from_file(str(file_path))
     return str(file_path.relative_to(MEDIA_DIR)), metadata
@@ -186,33 +210,85 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 # ------------------- MUSIC -------------------
 @app.post("/music", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin)])
-async def upload_music(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_music(
+    file: UploadFile = File(...),
+    music_data: MusicCreate = Depends(),
+    current_user: dict = Depends(get_current_user)
+):
     file_path, metadata = await save_uploaded_file(file, current_user)
 
     music_entry = {
-        "name": metadata.get("name"),
-        "artist": metadata.get("artist"),
+        "name": music_data.name or metadata.get("name"),
+        "artist": music_data.artist or metadata.get("artist"),
         "music_director": metadata.get("music_director"),
         "singer": metadata.get("singer"),
-        "genre": metadata.get("genre"),
-        "description": "",
+        "genre": music_data.genre or metadata.get("genre"),
+        "description": music_data.description or "",
+        "language": music_data.language,
+        "category": music_data.category,
+        "is_keefy_original": music_data.is_keefy_original,
         "uploaded_by": current_user["username"],
         "uploaded_at": datetime.utcnow(),
         "file_path": file_path,
         "is_completed": False
     }
 
+    required_fields = ["name", "artist", "genre", "language", "category", "is_keefy_original"]
+    missing_metadata = [field for field in required_fields if not music_entry.get(field)]
+
+    if missing_metadata:
+        return {
+            "msg": "File uploaded. Metadata incomplete.",
+            "music_id": str(await music_col.insert_one(music_entry).inserted_id),
+            "file_path": file_path,
+            "missing_metadata": missing_metadata,
+            "success": False
+        }
+
     result = await music_col.insert_one(music_entry)
-
-    missing_metadata = [f for f in ["name", "artist", "music_director", "singer", "genre"] if not music_entry.get(f)]
-
     return {
-        "msg": "File uploaded. Metadata incomplete.",
+        "msg": "Music uploaded successfully",
         "music_id": str(result.inserted_id),
         "file_path": file_path,
-        "missing_metadata": missing_metadata,
-        "success": False
+        "success": True
     }
+
+
+@app.get("/music", response_model=List[dict], tags=["Music"])
+async def get_all_music(
+    skip: int = 0,
+    limit: int = 100,  # Optional pagination
+    current_user: Optional[dict] = Depends(get_current_user, use_cache=False)  # Optional: for authenticated users only if needed
+):
+    """
+    Retrieve all music entries.
+    - skip: Number of records to skip (for pagination).
+    - limit: Max number of records to return.
+    """
+    # If you want admin-only, add: dependencies=[Depends(require_admin)]
+    pipeline = [
+        {"$sort": {"uploaded_at": -1}},  # Newest first
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$project": {
+            "_id": {"$toString": "$_id"},
+            "name": 1,
+            "artist": 1,
+            "music_director": 1,
+            "singer": 1,
+            "genre": 1,
+            "description": 1,
+            "language": 1,
+            "category": 1,
+            "is_keefy_original": 1,
+            "uploaded_by": 1,
+            "uploaded_at": {"$dateToString": {"format": "%Y-%m-%d %H:%M:%S", "date": "$uploaded_at"}},
+            "file_path": 1,
+            "is_completed": 1
+        }}
+    ]
+    songs = await music_col.aggregate(pipeline).to_list(length=limit)
+    return songs
 
 @app.put("/music/{music_id}", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin)])
 async def update_music_metadata(music_id: str, music_data: MusicUpdate, current_user: dict = Depends(get_current_user)):
