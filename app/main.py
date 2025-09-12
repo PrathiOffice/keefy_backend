@@ -64,31 +64,39 @@ artists_col = db["artists"]
 
 # Initialize master lists and indexes
 async def init_db():
-    await users_col.create_index([("username", 1)], unique=True)
-    await users_col.create_index([("email", 1)], unique=True)
-    await music_col.create_index([("uploaded_by", 1), ("language", 1), ("category", 1)])
-    await music_col.create_index([("artist", 1), ("music_director", 1)])
-    await music_col.create_index([("name", 1), ("movie_name", 1), ("actor_name", 1)])
-    await artists_col.create_index([("name", 1)], unique=True)
+    try:
+        # Create indexes with error handling
+        await users_col.create_index([("username", 1)], unique=True, partialFilterExpression={"username": {"$exists": True}})
+        await users_col.create_index([("email", 1)], unique=True, partialFilterExpression={"email": {"$exists": True}})
+        await music_col.create_index([("uploaded_by", 1), ("language", 1), ("category", 1)])
+        await music_col.create_index([("artist", 1), ("music_director", 1)])
+        await music_col.create_index([("name", 1), ("movie_name", 1), ("actor_name", 1)])
+        await artists_col.create_index([("name", 1)], unique=True, partialFilterExpression={"name": {"$exists": True}})
 
-    master_data = {
-        "languages": ["English", "Spanish", "Hindi", "Tamil", "Telugu"],
-        "categories": ["Pop", "Love", "Rock", "Classical", "Hip-Hop", "Jazz"],
-        "actors": ["Tom Hanks", "Aamir Khan", "Priyanka Chopra", "Leonardo DiCaprio", "Rajinikanth"],
-        "music_directors": ["A.R. Rahman", "John Williams", "Hans Zimmer", "Ilaiyaraaja"],
-        "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception"],
-        "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran"]
-    }
-    for collection, items in master_data.items():
-        col = await get_collection(collection)
-        for item in items:
-            if not await col.find_one({"name": item}):
-                await col.insert_one({"name": item})
+        # Master data for collections
+        master_data = {
+            "languages": ["English", "Spanish", "Hindi", "Tamil", "Telugu"],
+            "categories": ["Pop", "Love", "Rock", "Classical", "Hip-Hop", "Jazz"],
+            "actors": ["Tom Hanks", "Aamir Khan", "Priyanka Chopra", "Leonardo DiCaprio", "Rajinikanth"],
+            "music_directors": ["A.R. Rahman", "John Williams", "Hans Zimmer", "Ilaiyaraaja"],
+            "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception"],
+            "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran"]
+        }
 
-@app.on_event("startup")
-async def startup_event():
-    await init_db()
-
+        # Insert master data only if it doesn't exist
+        for collection, items in master_data.items():
+            col = await get_collection(collection)
+            for item in items:
+                try:
+                    existing_item = await col.find_one({"name": item})
+                    if not existing_item:
+                        await col.insert_one({"name": item})
+                except Exception as e:
+                    print(f"Error inserting {item} into {collection}: {e}")
+                    # Continue to avoid crashing on duplicate or minor errors
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to initialize database")
 # ------------------- MODELS -------------------
 class UserRegister(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
