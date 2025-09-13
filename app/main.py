@@ -40,7 +40,7 @@ app = FastAPI(
         {"name": "Auth", "description": "User authentication and registration"},
         {"name": "Music", "description": "Music upload and retrieval (Admin upload only)"},
         {"name": "Users", "description": "User management (Admin access for bulk)"},
-        {"name": "Master", "description": "Retrieve master lists for actors, movies, music directors, artists"}
+        {"name": "Master", "description": "Manage master lists for actors, movies, music directors, artists"}
     ]
 )
 
@@ -115,38 +115,10 @@ async def init_db():
         master_data = {
             "languages": ["English", "Spanish", "Hindi", "Tamil", "Telugu"],
             "categories": ["Pop", "Love", "Rock", "Classical", "Hip-Hop", "Jazz"],
-"actors": [
-        # Tamil Actors
-        "Pradeep Ranganathan", "Ajith", "Dhanush", "Vijay", "Rajinikanth", 
-        "Sivakarthikeyan", "Suriya", "Karthi", "Vikram", "Jayam Ravi",
-        "Arya", "Vishal", "Jiiva", "Santhanam", "Soori",
-        
-        # Tamil Actresses
-        "Nayanthara", "Trisha", "Samantha", "Shruti Haasan", "Hansika Motwani",
-        "Keerthy Suresh", "Anushka Shetty", "Tamannaah", "Kajal Aggarwal",
-        
-        # Hindi/Bollywood Actors
-        "Shah Rukh Khan", "Aamir Khan", "Salman Khan", "Akshay Kumar", 
-        "Hrithik Roshan", "Ranbir Kapoor", "Ranveer Singh", "Varun Dhawan",
-        "Ayushmann Khurrana", "Rajkummar Rao",
-        
-        # Hindi/Bollywood Actresses
-        "Deepika Padukone", "Priyanka Chopra", "Kareena Kapoor", "Katrina Kaif",
-        "Alia Bhatt", "Anushka Sharma", "Sonam Kapoor",
-        
-        # Hollywood Actors
-        "Tom Hanks", "Leonardo DiCaprio", "Brad Pitt", "Will Smith",
-        "Robert Downey Jr.", "Chris Evans", "Dwayne Johnson"
-    ],           
-    "music_directors": [
-        "A.R. Rahman", "Ilaiyaraaja", "Devi Sri Prasad", "Anirudh Ravichander",
-        "Yuvan Shankar Raja", "Harris Jayaraj", "Thaman", "G.V. Prakash Kumar",
-        "Santhosh Narayanan", "Imman", "John Williams", "Hans Zimmer", 
-        "Alan Silvestri", "Thomas Newman"
-    ],            
-    "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception", "LIK"],
-            
-    "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran", "Sagar", "Sumangali"]
+            "actors": ["Rajinikanth", "Pradeep Ranganathan"],
+            "music_directors": ["A.R. Rahman", "John Williams", "Hans Zimmer", "Ilaiyaraaja", "Devi Sri Prasad"],
+            "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception", "LIK"],
+            "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran", "Sagar", "Sumangali"]
         }
 
         # Insert master data only if it doesn't exist
@@ -160,14 +132,11 @@ async def init_db():
                             await col.insert_one({"name": item})
                     except Exception as e:
                         print(f"Error inserting {item} into {collection}: {e}")
-                        # Continue to avoid crashing on duplicate or minor errors
         
         print("Database initialization completed successfully")
         
     except Exception as e:
         print(f"Database initialization failed: {e}")
-        # Don't raise HTTPException here as it's not in a request context
-        # Just log the error and continue
         print("Continuing without full database initialization...")
 
 # ------------------- MODELS -------------------
@@ -212,6 +181,12 @@ class MusicUpdate(BaseModel):
     movie_name: Optional[str] = None
     actor_name: Optional[str] = None
 
+class MasterDataCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+
+class BulkMasterDataCreate(BaseModel):
+    items: List[str] = Field(..., min_items=1, max_items=100)
+
 # ------------------- VALIDATORS -------------------
 async def validate_master_field(field: str, value: Optional[str], collection):
     if value:
@@ -219,8 +194,17 @@ async def validate_master_field(field: str, value: Optional[str], collection):
         existing_item = await collection.find_one({"name": {"$regex": f"^{normalized_value}$", "$options": "i"}})
         if not existing_item:
             raise ValueError(f"Invalid {field}: {value}. Must be one of the predefined {field}s.")
-        return value  # Return the original value to preserve case if needed
+        return value
     return value
+
+async def add_movie_if_not_exists(movie_name: Optional[str]):
+    if movie_name and movie_name.strip():
+        normalized_name = movie_name.lower()
+        existing_movie = await movies_col.find_one({"name": {"$regex": f"^{normalized_name}$", "$options": "i"}})
+        if not existing_movie:
+            await movies_col.insert_one({"name": movie_name})
+        return movie_name
+    return movie_name
 
 async def get_music_data_from_form(
     name: Optional[str] = Form(None),
@@ -249,7 +233,6 @@ async def get_music_data_from_form(
         singer=singer
     )
     
-    # Validate the fields
     try:
         if music_data.language:
             music_data.language = await validate_master_field("language", music_data.language, languages_col)
@@ -259,10 +242,10 @@ async def get_music_data_from_form(
             music_data.artist = await validate_master_field("artist", music_data.artist, artists_col)
         if music_data.music_director:
             music_data.music_director = await validate_master_field("music_director", music_data.music_director, music_directors_col)
-        if music_data.movie_name:
-            music_data.movie_name = await validate_master_field("movie_name", music_data.movie_name, movies_col)
         if music_data.actor_name:
             music_data.actor_name = await validate_master_field("actor_name", music_data.actor_name, actors_col)
+        # Add movie_name to movies collection if it doesn't exist
+        music_data.movie_name = await add_movie_if_not_exists(music_data.movie_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     
@@ -274,8 +257,9 @@ async def validate_music_update(music: MusicUpdate = Depends()):
         music.category = await validate_master_field("category", music.category, categories_col)
         music.artist = await validate_master_field("artist", music.artist, artists_col)
         music.music_director = await validate_master_field("music_director", music.music_director, music_directors_col)
-        music.movie_name = await validate_master_field("movie_name", music.movie_name, movies_col)
         music.actor_name = await validate_master_field("actor_name", music.actor_name, actors_col)
+        # Add movie_name to movies collection if it doesn't exist
+        music.movie_name = await add_movie_if_not_exists(music.movie_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return music
@@ -347,6 +331,9 @@ async def save_uploaded_file(upload_file: UploadFile, current_user: dict) -> tup
             await buffer.write(content)
 
     metadata = await extract_metadata_from_file(str(file_path))
+    # Add movie_name from metadata to movies collection if it doesn't exist
+    if metadata.get("movie_name"):
+        metadata["movie_name"] = await add_movie_if_not_exists(metadata["movie_name"])
     return str(file_path.relative_to(MEDIA_DIR)), metadata
 
 async def get_collection(collection_name: str):
@@ -397,143 +384,14 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer", "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60}
 
 # ------------------- MASTER LIST MANAGEMENT -------------------
-# Add this to your routes section
-
-@app.post("/master/{collection}/add", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
-async def add_to_master_list(collection: str, name: str = Form(...)):
-    """Add a new item to a master collection (Admin only)"""
-    
-    # Validate collection exists
-    col = await get_collection(collection)
-    if col is None:
-        available_collections = list((await get_collection_all()).keys())
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid collection: '{collection}'. Available: {available_collections}"
-        )
-    
-    # Validate name is not empty
-    name = name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Name cannot be empty")
-    
-    try:
-        # Check if already exists (case-insensitive)
-        existing = await col.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
-        if existing:
-            return {
-                "msg": f"{name} already exists in {collection}",
-                "success": False,
-                "existing_name": existing["name"]
-            }
-        
-        # Insert new item
-        result = await col.insert_one({"name": name})
-        return {
-            "msg": f"Successfully added '{name}' to {collection}",
-            "success": True,
-            "id": str(result.inserted_id)
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error adding to {collection}: {str(e)}")
-
-# Bulk add endpoint
-@app.post("/master/{collection}/bulk-add", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
-async def bulk_add_to_master_list(collection: str, names: List[str]):
-    """Add multiple items to a master collection (Admin only)"""
-    
-    col = await get_collection(collection)
-    if col is None:
-        available_collections = list((await get_collection_all()).keys())
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid collection: '{collection}'. Available: {available_collections}"
-        )
-    
-    results = {
-        "added": [],
-        "skipped": [],
-        "errors": []
-    }
-    
-    for name in names:
-        name = name.strip()
-        if not name:
-            results["errors"].append({"name": name, "error": "Empty name"})
-            continue
-            
-        try:
-            # Check if already exists
-            existing = await col.find_one({"name": {"$regex": f"^{name}$", "$options": "i"}})
-            if existing:
-                results["skipped"].append({"name": name, "reason": "Already exists"})
-                continue
-            
-            # Insert new item
-            result = await col.insert_one({"name": name})
-            results["added"].append({"name": name, "id": str(result.inserted_id)})
-            
-        except Exception as e:
-            results["errors"].append({"name": name, "error": str(e)})
-    
-    return {
-        "msg": f"Bulk add to {collection} completed",
-        "success": True,
-        "results": results,
-        "summary": {
-            "added_count": len(results["added"]),
-            "skipped_count": len(results["skipped"]),
-            "error_count": len(results["errors"])
-        }
-    }
-
 @app.get("/master/{collection}", response_model=List[str], tags=["Master"], dependencies=[Depends(verify_api_key)])
 async def get_master_list(collection: str):
-    print(f"DEBUG - Requested collection: '{collection}'")
-    all_collections = await get_collection_all()
-    print(f"DEBUG - Available collections: {list(all_collections.keys())}")
     col = await get_collection(collection)
     if col is None:
-        available_collections = list(all_collections.keys())
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Invalid collection: '{collection}'. Available collections: {available_collections}"
-        )
-    try:
-        items = await col.find().to_list(length=None)  # Remove length limit
-        result = [item["name"] for item in items]
-        print(f"DEBUG - Found {len(result)} items in {collection}: {result}")
-        return result
-    except Exception as e:
-        print(f"DEBUG - Error fetching from {collection}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching data from {collection}: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid collection: {collection}")
+    items = await col.find().to_list(length=1000)
+    return [item["name"] for item in items]
 
-# Add a route to list all available collections
-@app.get("/master", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key)])
-async def list_available_collections():
-    """List all available master collections"""
-    all_collections = await get_collection_all()
-    collections_info = {}
-    
-    for name, col in all_collections.items():
-        try:
-            count = await col.count_documents({})
-            collections_info[name] = {
-                "count": count,
-                "endpoint": f"/master/{name}"
-            }
-        except Exception as e:
-            collections_info[name] = {
-                "count": 0,
-                "error": str(e),
-                "endpoint": f"/master/{name}"
-            }
-    
-    return {
-        "available_collections": list(all_collections.keys()),
-        "collections_info": collections_info
-    }
 @app.get("/master/search", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key)])
 async def search_master(q: Optional[str] = Query(None), collections: Optional[List[str]] = Query(None)):
     all_collections = await get_collection_all()
@@ -549,6 +407,68 @@ async def search_master(q: Optional[str] = Query(None), collections: Optional[Li
         results[name] = [doc["name"] for doc in matches]
     return {"query": q, "results": results} if q else {"results": results}
 
+@app.post("/master/{collection}", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
+async def add_master_data(collection: str, master_data: MasterDataCreate):
+    col = await get_collection(collection)
+    if col is None:
+        raise HTTPException(status_code=400, detail=f"Invalid collection: {collection}")
+    
+    # Check for existing entry (case-insensitive)
+    normalized_name = master_data.name.lower()
+    existing_item = await col.find_one({"name": {"$regex": f"^{normalized_name}$", "$options": "i"}})
+    if existing_item:
+        raise HTTPException(status_code=400, detail=f"Item '{master_data.name}' already exists in {collection}")
+    
+    # Insert new master data
+    result = await col.insert_one({"name": master_data.name})
+    return {
+        "msg": f"Successfully added '{master_data.name}' to {collection}",
+        "item_id": str(result.inserted_id),
+        "success": True
+    }
+
+@app.post("/master/{collection}/bulk", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
+async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate):
+    col = await get_collection(collection)
+    if col is None:
+        raise HTTPException(status_code=400, detail=f"Invalid collection: {collection}")
+    
+    inserted_count = 0
+    failed_items = []
+    existing_items = []
+    
+    for item in bulk_data.items:
+        if not item.strip():
+            failed_items.append({"item": item, "reason": "Empty or invalid name"})
+            continue
+            
+        normalized_item = item.lower()
+        existing = await col.find_one({"name": {"$regex": f"^{normalized_item}$", "$options": "i"}})
+        if existing:
+            existing_items.append(item)
+            continue
+            
+        try:
+            await col.insert_one({"name": item})
+            inserted_count += 1
+        except Exception as e:
+            failed_items.append({"item": item, "reason": str(e)})
+    
+    response = {
+        "msg": f"Processed bulk insert for {collection}",
+        "inserted_count": inserted_count,
+        "total_submitted": len(bulk_data.items),
+        "success": True
+    }
+    
+    if existing_items:
+        response["existing_items"] = existing_items
+    if failed_items:
+        response["failed_items"] = failed_items
+        response["success"] = False if inserted_count == 0 else True
+        
+    return response
+
 # ------------------- MUSIC -------------------
 @app.post("/music", response_model=dict, tags=["Music"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
 async def upload_music(
@@ -557,17 +477,6 @@ async def upload_music(
     current_user: dict = Depends(get_current_user)
 ):
     file_path, metadata = await save_uploaded_file(file, current_user)
-    
-    # Debug logging
-    print(f"DEBUG - Received form data:")
-    print(f"  language: '{music_data.language}' (type: {type(music_data.language)})")
-    print(f"  genre: '{music_data.genre}' (type: {type(music_data.genre)})")
-    print(f"  category: '{music_data.category}' (type: {type(music_data.category)})")
-    
-    print(f"DEBUG - Metadata from file:")
-    print(f"  language: '{metadata.get('language')}' (type: {type(metadata.get('language'))})")
-    print(f"  genre: '{metadata.get('genre')}' (type: {type(metadata.get('genre'))})")
-    print(f"  category: '{metadata.get('category')}' (type: {type(metadata.get('category'))})")
     
     music_entry = {
         "name": music_data.name if music_data.name else (metadata.get("name") or f"Unnamed_{file.filename}"),
@@ -587,11 +496,6 @@ async def upload_music(
         "is_completed": False
     }
     
-    print(f"DEBUG - Final music_entry values:")
-    print(f"  language: '{music_entry['language']}'")
-    print(f"  genre: '{music_entry['genre']}'")
-    print(f"  category: '{music_entry['category']}'")
-    
     result = await music_col.insert_one(music_entry)
     stored_data = {k: str(v) if isinstance(v, ObjectId) else v for k, v in music_entry.items()}
     
@@ -601,17 +505,8 @@ async def upload_music(
         "file_path": file_path,
         "provided_data": music_data.dict(exclude_unset=True),
         "stored_data": stored_data,
-        "debug_info": {
-            "received_language": music_data.language,
-            "received_genre": music_data.genre,
-            "received_category": music_data.category,
-            "final_language": music_entry['language'],
-            "final_genre": music_entry['genre'],
-            "final_category": music_entry['category']
-        },
         "success": True
     }
-
 
 @app.get("/music", response_model=List[dict], tags=["Music"], dependencies=[Depends(verify_api_key)])
 async def get_all_music(
@@ -645,7 +540,6 @@ async def get_all_music(
         if value:
             match_conditions.append({field: {"$regex": value, "$options": "i"}})
 
-    # Add is_keefy_original separately if provided, as it's a boolean
     if is_keefy_original is not None:
         match_conditions.append({"is_keefy_original": is_keefy_original})
 
