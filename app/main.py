@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File, Query, Form
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr, Field
 from passlib.context import CryptContext
@@ -146,9 +146,11 @@ class UserRegister(BaseModel):
     password: str = Field(..., min_length=8)
     role: str = Field(..., pattern="^(admin|music_lover)$")
 
-class UserLogin(BaseModel):
+class UserInfo(BaseModel):
     username: str
-    password: str
+    email: EmailStr
+    role: str
+    created_at: datetime
 
 class Token(BaseModel):
     access_token: str
@@ -375,13 +377,39 @@ async def register(user: UserRegister):
     return {"msg": "User registered successfully", "user_id": str(result.inserted_id)}
 
 @app.post("/login", response_model=Token, tags=["Auth"], dependencies=[Depends(verify_api_key)])
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = await users_col.find_one({"$or": [{"username": form_data.username}, {"email": form_data.username}]})
-    if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+async def login(
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form(..., pattern="^(admin|music_lover)$")
+):
+    user = await users_col.find_one({"$or": [{"username": username}, {"email": username}]})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials: Username or email not found")
+    
+    if not verify_password(password, user["password"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials: Password does not match")
+    
+    # Validate role
+    if role != user["role"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Invalid role: You are not a {role}. Your registered role is {user['role']}."
+        )
 
     access_token = create_access_token(data={"sub": user["username"], "role": user["role"]})
     return {"access_token": access_token, "token_type": "bearer", "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60}
+
+# ------------------- USER INFO -------------------
+@app.get("/me", response_model=UserInfo, tags=["Users"], dependencies=[Depends(verify_api_key)])
+async def get_user_info(current_user: dict = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing token")
+    return UserInfo(
+        username=current_user["username"],
+        email=current_user["email"],
+        role=current_user["role"],
+        created_at=current_user["created_at"]
+    )
 
 # ------------------- MASTER LIST MANAGEMENT -------------------
 @app.get("/master/{collection}", response_model=List[str], tags=["Master"], dependencies=[Depends(verify_api_key)])
