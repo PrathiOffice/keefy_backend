@@ -25,8 +25,10 @@ API_KEY = os.getenv("API_KEY")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "musicapp")
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "app/media"))
+IMAGE_DIR = Path(os.getenv("IMAGE_DIR", "app/images"))
 
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Cached password context for performance
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -35,10 +37,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
 app = FastAPI(
     title="Music App API",
     version="2.0.0",
-    description="Secure Music Management API with Admin Controls and Master Lists",
+    description="Secure Music Management API with Admin Controls, Master Lists, and Image Support",
     openapi_tags=[
         {"name": "Auth", "description": "User authentication and registration"},
         {"name": "Music", "description": "Music upload and retrieval (Admin upload only)"},
+        {"name": "Images", "description": "Image upload and retrieval for music"},
         {"name": "Users", "description": "User management (Admin access for bulk)"},
         {"name": "Master", "description": "Manage master lists for actors, movies, music directors, artists"}
     ]
@@ -61,55 +64,28 @@ actors_col = db["actors"]
 music_directors_col = db["music_directors"]
 movies_col = db["movies"]
 artists_col = db["artists"]
+images_col = db["images"]
 
 # Initialize master lists and indexes
 async def init_db():
     try:
-        # Create indexes with error handling - use specific names to avoid conflicts
-        try:
-            await users_col.create_index([("username", 1)], unique=True, name="username_unique_idx")
-        except Exception as e:
-            if "already exists" in str(e) or "IndexKeySpecsConflict" in str(e):
-                print(f"Username index already exists, skipping: {e}")
-            else:
-                print(f"Error creating username index: {e}")
-        
-        try:
-            await users_col.create_index([("email", 1)], unique=True, name="email_unique_idx")
-        except Exception as e:
-            if "already exists" in str(e) or "IndexKeySpecsConflict" in str(e):
-                print(f"Email index already exists, skipping: {e}")
-            else:
-                print(f"Error creating email index: {e}")
-        
-        # Create other indexes with error handling
-        indexes_to_create = [
-            (music_col, [("uploaded_by", 1), ("language", 1), ("category", 1)], "music_search_idx"),
-            (music_col, [("artist", 1), ("music_director", 1)], "music_creators_idx"),
-            (music_col, [("name", 1), ("movie_name", 1), ("actor_name", 1)], "music_names_idx"),
+        # Create indexes with error handling
+        indexes = [
+            (users_col, [("username", 1)], "username_unique_idx", True),
+            (users_col, [("email", 1)], "email_unique_idx", True),
+            (music_col, [("uploaded_by", 1), ("language", 1), ("category", 1)], "music_search_idx", False),
+            (music_col, [("artist", 1), ("music_director", 1)], "music_creators_idx", False),
+            (music_col, [("name", 1), ("movie_name", 1), ("actor_name", 1)], "music_names_idx", False),
+            (images_col, [("name", 1)], "image_name_unique_idx", True)
         ]
-        
-        for col, keys, name in indexes_to_create:
+        for col, keys, name, unique in indexes:
             try:
-                await col.create_index(keys, name=name)
+                await col.create_index(keys, unique=unique, name=name)
             except Exception as e:
                 if "already exists" in str(e) or "IndexKeySpecsConflict" in str(e):
                     print(f"Index {name} already exists, skipping: {e}")
                 else:
                     print(f"Error creating index {name}: {e}")
-
-        # Create unique indexes for master collections
-        master_collections = ["actors", "movies", "music_directors", "artists", "categories", "languages"]
-        for collection_name in master_collections:
-            try:
-                col = await get_collection(collection_name)
-                if col:
-                    await col.create_index([("name", 1)], unique=True, name=f"{collection_name}_name_unique_idx")
-            except Exception as e:
-                if "already exists" in str(e) or "IndexKeySpecsConflict" in str(e):
-                    print(f"Index for {collection_name} already exists, skipping: {e}")
-                else:
-                    print(f"Error creating index for {collection_name}: {e}")
 
         # Master data for collections
         master_data = {
@@ -118,10 +94,9 @@ async def init_db():
             "actors": ["Rajinikanth", "Pradeep Ranganathan"],
             "music_directors": ["A.R. Rahman", "John Williams", "Hans Zimmer", "Ilaiyaraaja", "Devi Sri Prasad"],
             "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception", "LIK"],
-            "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran", "Sagar", "Sumangali"]
+            "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran", "Sagar", "Sumangali"],
+            "images": ["default_cover.jpg", "album_art1.jpg", "album_art2.jpg"]
         }
-
-        # Insert master data only if it doesn't exist
         for collection, items in master_data.items():
             col = await get_collection(collection)
             if col:
@@ -129,15 +104,17 @@ async def init_db():
                     try:
                         existing_item = await col.find_one({"name": item})
                         if not existing_item:
-                            await col.insert_one({"name": item})
+                            doc = {"name": item}
+                            if collection == "images":
+                                doc["file_path"] = f"images/{item}"
+                                doc["uploaded_at"] = datetime.utcnow()
+                            await col.insert_one(doc)
                     except Exception as e:
                         print(f"Error inserting {item} into {collection}: {e}")
         
         print("Database initialization completed successfully")
-        
     except Exception as e:
         print(f"Database initialization failed: {e}")
-        print("Continuing without full database initialization...")
 
 # ------------------- MODELS -------------------
 class UserRegister(BaseModel):
@@ -169,6 +146,7 @@ class MusicCreate(BaseModel):
     actor_name: Optional[str] = None
     music_director: Optional[str] = None
     singer: Optional[str] = None
+    image_id: Optional[str] = None
 
 class MusicUpdate(BaseModel):
     name: str = Field(..., min_length=1)
@@ -182,6 +160,7 @@ class MusicUpdate(BaseModel):
     is_keefy_original: bool
     movie_name: Optional[str] = None
     actor_name: Optional[str] = None
+    image_id: Optional[str] = None
 
 class MasterDataCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
@@ -220,6 +199,7 @@ async def get_music_data_from_form(
     actor_name: Optional[str] = Form(None),
     music_director: Optional[str] = Form(None),
     singer: Optional[str] = Form(None),
+    image_id: Optional[str] = Form(None)
 ) -> MusicCreate:
     music_data = MusicCreate(
         name=name,
@@ -232,7 +212,8 @@ async def get_music_data_from_form(
         movie_name=movie_name,
         actor_name=actor_name,
         music_director=music_director,
-        singer=singer
+        singer=singer,
+        image_id=image_id
     )
     
     try:
@@ -246,7 +227,14 @@ async def get_music_data_from_form(
             music_data.music_director = await validate_master_field("music_director", music_data.music_director, music_directors_col)
         if music_data.actor_name:
             music_data.actor_name = await validate_master_field("actor_name", music_data.actor_name, actors_col)
-        # Add movie_name to movies collection if it doesn't exist
+        if music_data.image_id:
+            try:
+                obj_id = ObjectId(music_data.image_id)
+                image = await images_col.find_one({"_id": obj_id})
+                if not image:
+                    raise ValueError(f"Invalid image_id: {music_data.image_id}")
+            except Exception:
+                raise ValueError(f"Invalid image_id format: {music_data.image_id}")
         music_data.movie_name = await add_movie_if_not_exists(music_data.movie_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -260,7 +248,14 @@ async def validate_music_update(music: MusicUpdate = Depends()):
         music.artist = await validate_master_field("artist", music.artist, artists_col)
         music.music_director = await validate_master_field("music_director", music.music_director, music_directors_col)
         music.actor_name = await validate_master_field("actor_name", music.actor_name, actors_col)
-        # Add movie_name to movies collection if it doesn't exist
+        if music.image_id:
+            try:
+                obj_id = ObjectId(music.image_id)
+                image = await images_col.find_one({"_id": obj_id})
+                if not image:
+                    raise ValueError(f"Invalid image_id: {music.image_id}")
+            except Exception:
+                raise ValueError(f"Invalid image_id format: {music.image_id}")
         music.movie_name = await add_movie_if_not_exists(music.movie_name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -333,10 +328,32 @@ async def save_uploaded_file(upload_file: UploadFile, current_user: dict) -> tup
             await buffer.write(content)
 
     metadata = await extract_metadata_from_file(str(file_path))
-    # Add movie_name from metadata to movies collection if it doesn't exist
     if metadata.get("movie_name"):
         metadata["movie_name"] = await add_movie_if_not_exists(metadata["movie_name"])
     return str(file_path.relative_to(MEDIA_DIR)), metadata
+
+async def save_uploaded_image(upload_file: UploadFile, current_user: dict) -> tuple[str, str]:
+    ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
+    file_extension = Path(upload_file.filename).suffix.lower()
+    if file_extension not in ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format. Only {', '.join(ALLOWED_IMAGE_EXTENSIONS)} allowed.")
+
+    file_hash = hashlib.md5(f"{upload_file.filename}{current_user['username']}{datetime.utcnow().timestamp()}".encode()).hexdigest()
+    filename = f"{file_hash}{file_extension}"
+    file_path = IMAGE_DIR / filename
+
+    async with aiofiles.open(file_path, 'wb') as buffer:
+        while content := await upload_file.read(1024 * 1024):
+            await buffer.write(content)
+
+    image_entry = {
+        "name": upload_file.filename,
+        "file_path": str(file_path.relative_to(IMAGE_DIR)),
+        "uploaded_by": current_user["username"],
+        "uploaded_at": datetime.utcnow()
+    }
+    result = await images_col.insert_one(image_entry)
+    return str(file_path.relative_to(IMAGE_DIR)), str(result.inserted_id)
 
 async def get_collection(collection_name: str):
     collections = {
@@ -345,7 +362,8 @@ async def get_collection(collection_name: str):
         "music_directors": music_directors_col,
         "artists": artists_col,
         "categories": categories_col,
-        "languages": languages_col
+        "languages": languages_col,
+        "images": images_col
     }
     return collections.get(collection_name)
 
@@ -356,7 +374,8 @@ async def get_collection_all():
         "music_directors": music_directors_col,
         "artists": artists_col,
         "categories": categories_col,
-        "languages": languages_col
+        "languages": languages_col,
+        "images": images_col
     }
 
 # ------------------- AUTH -------------------
@@ -384,18 +403,14 @@ async def login(
 ):
     user = await users_col.find_one({"$or": [{"username": username}, {"email": username}]})
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials: Username or email not found")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
     if not verify_password(password, user["password"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials: Password does not match")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
-    # Validate role
     if role != user["role"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Invalid role: You are not a {role}. Your registered role is {user['role']}."
-        )
-
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Invalid role: You are not a {role}")
+    
     access_token = create_access_token(data={"sub": user["username"], "role": user["role"]})
     return {"access_token": access_token, "token_type": "bearer", "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60}
 
@@ -425,13 +440,10 @@ async def search_master(q: Optional[str] = Query(None), collections: Optional[Li
     all_collections = await get_collection_all()
     target_collections = {k: v for k, v in all_collections.items() if not collections or k in collections}
     if not target_collections:
-        raise HTTPException(status_code=400, detail=f"Invalid collection(s). Must be one or more of {list(all_collections.keys())}")
+        raise HTTPException(status_code=400, detail=f"Invalid collection(s)")
     results = {}
     for name, col in target_collections.items():
-        if q:
-            matches = await col.find({"name": {"$regex": q, "$options": "i"}}).to_list(length=20)
-        else:
-            matches = await col.find().to_list(length=1000)
+        matches = await col.find({"name": {"$regex": q, "$options": "i"}} if q else {}).to_list(length=1000)
         results[name] = [doc["name"] for doc in matches]
     return {"query": q, "results": results} if q else {"results": results}
 
@@ -441,19 +453,13 @@ async def add_master_data(collection: str, master_data: MasterDataCreate):
     if col is None:
         raise HTTPException(status_code=400, detail=f"Invalid collection: {collection}")
     
-    # Check for existing entry (case-insensitive)
     normalized_name = master_data.name.lower()
     existing_item = await col.find_one({"name": {"$regex": f"^{normalized_name}$", "$options": "i"}})
     if existing_item:
-        raise HTTPException(status_code=400, detail=f"Item '{master_data.name}' already exists in {collection}")
+        raise HTTPException(status_code=400, detail=f"Item '{master_data.name}' already exists")
     
-    # Insert new master data
     result = await col.insert_one({"name": master_data.name})
-    return {
-        "msg": f"Successfully added '{master_data.name}' to {collection}",
-        "item_id": str(result.inserted_id),
-        "success": True
-    }
+    return {"msg": f"Added '{master_data.name}' to {collection}", "item_id": str(result.inserted_id), "success": True}
 
 @app.post("/master/{collection}/bulk", response_model=dict, tags=["Master"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
 async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate):
@@ -467,15 +473,13 @@ async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate)
     
     for item in bulk_data.items:
         if not item.strip():
-            failed_items.append({"item": item, "reason": "Empty or invalid name"})
+            failed_items.append({"item": item, "reason": "Empty name"})
             continue
-            
         normalized_item = item.lower()
         existing = await col.find_one({"name": {"$regex": f"^{normalized_item}$", "$options": "i"}})
         if existing:
             existing_items.append(item)
             continue
-            
         try:
             await col.insert_one({"name": item})
             inserted_count += 1
@@ -486,15 +490,12 @@ async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate)
         "msg": f"Processed bulk insert for {collection}",
         "inserted_count": inserted_count,
         "total_submitted": len(bulk_data.items),
-        "success": True
+        "success": inserted_count > 0
     }
-    
     if existing_items:
         response["existing_items"] = existing_items
     if failed_items:
         response["failed_items"] = failed_items
-        response["success"] = False if inserted_count == 0 else True
-        
     return response
 
 # ------------------- MUSIC -------------------
@@ -502,25 +503,43 @@ async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate)
 async def upload_music(
     file: UploadFile = File(...),
     music_data: MusicCreate = Depends(get_music_data_from_form),
+    image_file: Optional[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user)
 ):
     file_path, metadata = await save_uploaded_file(file, current_user)
     
+    image_id = music_data.image_id
+    image_path = None
+    if image_file:
+        image_path, image_id = await save_uploaded_image(image_file, current_user)
+    elif music_data.image_id:
+        try:
+            obj_id = ObjectId(music_data.image_id)
+            image = await images_col.find_one({"_id": obj_id})
+            if image:
+                image_path = image["file_path"]
+            else:
+                raise HTTPException(status_code=400, detail=f"Image with ID {music_data.image_id} not found")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image ID format")
+
     music_entry = {
-        "name": music_data.name if music_data.name else (metadata.get("name") or f"Unnamed_{file.filename}"),
-        "artist": music_data.artist if music_data.artist else (metadata.get("artist") or ""),
-        "music_director": music_data.music_director if music_data.music_director else (metadata.get("music_director") or ""),
-        "singer": music_data.singer if music_data.singer else (metadata.get("singer") or ""),
-        "genre": music_data.genre if music_data.genre else (metadata.get("genre") or ""),
+        "name": music_data.name or metadata.get("name") or f"Unnamed_{file.filename}",
+        "artist": music_data.artist or metadata.get("artist") or "",
+        "music_director": music_data.music_director or metadata.get("music_director") or "",
+        "singer": music_data.singer or metadata.get("singer") or "",
+        "genre": music_data.genre or metadata.get("genre") or "",
         "description": music_data.description or "",
-        "language": music_data.language if music_data.language else (metadata.get("language") or ""),
-        "category": music_data.category if music_data.category else (metadata.get("category") or ""),
+        "language": music_data.language or metadata.get("language") or "",
+        "category": music_data.category or metadata.get("category") or "",
         "is_keefy_original": music_data.is_keefy_original if music_data.is_keefy_original is not None else False,
-        "movie_name": music_data.movie_name if music_data.movie_name else (metadata.get("movie_name") or ""),
-        "actor_name": music_data.actor_name if music_data.actor_name else "",
+        "movie_name": music_data.movie_name or metadata.get("movie_name") or "",
+        "actor_name": music_data.actor_name or "",
         "uploaded_by": current_user["username"],
         "uploaded_at": datetime.utcnow(),
         "file_path": file_path,
+        "image_id": image_id,
+        "image_path": image_path,
         "is_completed": False
     }
     
@@ -531,6 +550,8 @@ async def upload_music(
         "msg": "Music uploaded successfully",
         "music_id": str(result.inserted_id),
         "file_path": file_path,
+        "image_id": image_id,
+        "image_path": image_path,
         "provided_data": music_data.dict(exclude_unset=True),
         "stored_data": stored_data,
         "success": True
@@ -552,22 +573,22 @@ async def get_all_music(
     movie_name: Optional[str] = None,
     actor_name: Optional[str] = None
 ):
-    match_conditions = []
-    for field, value in [
-        ("name", name),
-        ("artist", artist),
-        ("music_director", music_director),
-        ("singer", singer),
-        ("genre", genre),
-        ("description", description),
-        ("language", language),
-        ("category", category),
-        ("movie_name", movie_name),
-        ("actor_name", actor_name)
-    ]:
-        if value:
-            match_conditions.append({field: {"$regex": value, "$options": "i"}})
-
+    match_conditions = [
+        {field: {"$regex": value, "$options": "i"}}
+        for field, value in [
+            ("name", name),
+            ("artist", artist),
+            ("music_director", music_director),
+            ("singer", singer),
+            ("genre", genre),
+            ("description", description),
+            ("language", language),
+            ("category", category),
+            ("movie_name", movie_name),
+            ("actor_name", actor_name)
+        ]
+        if value
+    ]
     if is_keefy_original is not None:
         match_conditions.append({"is_keefy_original": is_keefy_original})
 
@@ -584,7 +605,9 @@ async def get_all_music(
             "is_keefy_original": 1, "movie_name": 1, "actor_name": 1,
             "uploaded_by": 1,
             "uploaded_at": {"$dateToString": {"format": "%Y-%m-%d %H:%M:%S", "date": "$uploaded_at"}},
-            "file_path": 1, "is_completed": 1
+            "file_path": 1, "is_completed": 1,
+            "image_id": {"$toString": "$image_id"},
+            "image_path": 1
         }}
     ]
     return await music_col.aggregate(pipeline).to_list(length=limit)
@@ -598,6 +621,16 @@ async def update_music_metadata(music_id: str, music_data: MusicUpdate = Depends
     
     update_data = music_data.dict(exclude_unset=True)
     update_data["is_completed"] = True
+    if music_data.image_id:
+        try:
+            image = await images_col.find_one({"_id": ObjectId(music_data.image_id)})
+            if image:
+                update_data["image_path"] = image["file_path"]
+            else:
+                raise HTTPException(status_code=400, detail=f"Image with ID {music_data.image_id} not found")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image ID format")
+    
     result = await music_col.update_one({"_id": obj_id}, {"$set": update_data})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Music not found or no changes applied")
@@ -618,13 +651,56 @@ async def play_music(music_id: str):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=file_path, media_type="audio/mpeg", filename=file_path.name)
 
+# ------------------- IMAGES -------------------
+@app.post("/images", response_model=dict, tags=["Images"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
+async def upload_image(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    file_path, image_id = await save_uploaded_image(file, current_user)
+    return {
+        "msg": "Image uploaded successfully",
+        "image_id": image_id,
+        "file_path": file_path,
+        "success": True
+    }
+
+@app.get("/images", response_model=List[dict], tags=["Images"], dependencies=[Depends(verify_api_key)])
+async def get_all_images(skip: int = 0, limit: int = 100):
+    pipeline = [
+        {"$sort": {"uploaded_at": -1}},
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$project": {
+            "_id": {"$toString": "$_id"},
+            "name": 1,
+            "file_path": 1,
+            "uploaded_by": 1,
+            "uploaded_at": {"$dateToString": {"format": "%Y-%m-%d %H:%M:%S", "date": "$uploaded_at"}}
+        }}
+    ]
+    return await images_col.aggregate(pipeline).to_list(length=limit)
+
+@app.get("/images/{image_id}", response_model=None, tags=["Images"], dependencies=[Depends(verify_api_key)])
+async def get_image(image_id: str):
+    try:
+        obj_id = ObjectId(image_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image ID format")
+    
+    image = await images_col.find_one({"_id": obj_id})
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    file_path = IMAGE_DIR / image["file_path"]
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Image file not found")
+    return FileResponse(path=file_path, media_type="image/jpeg", filename=image["name"])
+
 # ------------------- HEALTH -------------------
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {
         "status": "healthy",
         "database": MONGO_DB_NAME,
-        "media_dir": str(MEDIA_DIR)
+        "media_dir": str(MEDIA_DIR),
+        "image_dir": str(IMAGE_DIR)
     }
 
 @app.on_event("startup")
