@@ -15,8 +15,12 @@ import aiofiles
 import hashlib
 from pathlib import Path
 from tinytag import TinyTag
+import logging
 
 # ------------------- CONFIG -------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
@@ -83,9 +87,9 @@ async def init_db():
                 await col.create_index(keys, unique=unique, name=name)
             except Exception as e:
                 if "already exists" in str(e) or "IndexKeySpecsConflict" in str(e):
-                    print(f"Index {name} already exists, skipping: {e}")
+                    logger.info(f"Index {name} already exists, skipping: {e}")
                 else:
-                    print(f"Error creating index {name}: {e}")
+                    logger.error(f"Error creating index {name}: {e}")
 
         # Master data for collections
         master_data = {
@@ -110,11 +114,11 @@ async def init_db():
                                 doc["uploaded_at"] = datetime.utcnow()
                             await col.insert_one(doc)
                     except Exception as e:
-                        print(f"Error inserting {item} into {collection}: {e}")
+                        logger.error(f"Error inserting {item} into {collection}: {e}")
         
-        print("Database initialization completed successfully")
+        logger.info("Database initialization completed successfully")
     except Exception as e:
-        print(f"Database initialization failed: {e}")
+        logger.error(f"Database initialization failed: {e}")
 
 # ------------------- MODELS -------------------
 class UserRegister(BaseModel):
@@ -327,9 +331,14 @@ async def save_uploaded_file(upload_file: UploadFile, current_user: dict) -> tup
     filename = f"{file_hash}{file_extension}"
     file_path = MEDIA_DIR / filename
 
+    logger.info(f"Saving audio file to {file_path}")
     async with aiofiles.open(file_path, 'wb') as buffer:
         while content := await upload_file.read(1024 * 1024):
             await buffer.write(content)
+
+    if not file_path.exists():
+        logger.error(f"Failed to save audio file: {file_path}")
+        raise HTTPException(status_code=500, detail="Failed to save audio file")
 
     metadata = await extract_metadata_from_file(str(file_path))
     if metadata.get("movie_name"):
@@ -346,9 +355,14 @@ async def save_uploaded_image(upload_file: UploadFile, current_user: dict) -> tu
     filename = f"{file_hash}{file_extension}"
     file_path = IMAGE_DIR / filename
 
+    logger.info(f"Saving image to {file_path}")
     async with aiofiles.open(file_path, 'wb') as buffer:
         while content := await upload_file.read(1024 * 1024):
             await buffer.write(content)
+
+    if not file_path.exists():
+        logger.error(f"Failed to save image file: {file_path}")
+        raise HTTPException(status_code=500, detail="Failed to save image file")
 
     image_entry = {
         "name": upload_file.filename,
@@ -681,6 +695,7 @@ async def play_music(music_id: str):
         raise HTTPException(status_code=404, detail="Music not found")
     file_path = MEDIA_DIR / music["file_path"]
     if not file_path.exists():
+        logger.error(f"Audio file not found: {file_path}")
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=file_path, media_type="audio/mpeg", filename=file_path.name)
 
@@ -722,8 +737,10 @@ async def get_image(image_id: str):
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
     file_path = IMAGE_DIR / image["file_path"]
+    logger.info(f"Attempting to retrieve image: {file_path}")
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Image file not found")
+        logger.error(f"Image file not found: {file_path}")
+        raise HTTPException(status_code=404, detail=f"Image file not found: {file_path}")
     return FileResponse(path=file_path, media_type="image/jpeg", filename=image["name"])
 
 # ------------------- HEALTH -------------------
