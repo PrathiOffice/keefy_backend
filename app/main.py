@@ -16,6 +16,7 @@ import hashlib
 from pathlib import Path
 from tinytag import TinyTag
 import logging
+import re
 
 # ------------------- CONFIG -------------------
 logging.basicConfig(level=logging.INFO)
@@ -80,7 +81,8 @@ async def init_db():
             (music_col, [("uploaded_by", 1), ("language", 1), ("category", 1)], "music_search_idx", False),
             (music_col, [("artist", 1), ("music_director", 1)], "music_creators_idx", False),
             (music_col, [("name", 1), ("movie_name", 1), ("actor_name", 1)], "music_names_idx", False),
-            (images_col, [("name", 1)], "image_name_unique_idx", True)
+            (images_col, [("name", 1)], "image_name_unique_idx", True),
+            (actors_col, [("name", 1)], "actor_name_idx", True)  # Added index for actor name
         ]
         for col, keys, name, unique in indexes:
             try:
@@ -95,7 +97,7 @@ async def init_db():
         master_data = {
             "languages": ["English", "Spanish", "Hindi", "Tamil", "Telugu"],
             "categories": ["Pop", "Love", "Rock", "Classical", "Hip-Hop", "Jazz"],
-            "actors": ["Rajinikanth", "Pradeep Ranganathan"],
+            "actors": ["Rajinikanth", "Pradeep Ranganathan", "Vijay"],
             "music_directors": ["A.R. Rahman", "John Williams", "Hans Zimmer", "Ilaiyaraaja", "Devi Sri Prasad"],
             "movies": ["Forrest Gump", "Lagaan", "Titanic", "Inception", "LIK"],
             "artists": ["Aamir Khan", "Adele", "Shreya Ghoshal", "Ed Sheeran", "Sagar", "Sumangali"],
@@ -138,6 +140,9 @@ class Token(BaseModel):
     token_type: str
     expires_in: int
 
+class ImageCreate(BaseModel):
+    actor_name: Optional[str] = None
+
 class MusicCreate(BaseModel):
     name: Optional[str] = None
     artist: Optional[str] = None
@@ -150,7 +155,7 @@ class MusicCreate(BaseModel):
     actor_name: Optional[str] = None
     music_director: Optional[str] = None
     singer: Optional[str] = None
-    image_id: Optional[str] = None
+    image_id: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{24}$")
 
 class MusicUpdate(BaseModel):
     name: str = Field(..., min_length=1)
@@ -164,15 +169,15 @@ class MusicUpdate(BaseModel):
     is_keefy_original: bool
     movie_name: Optional[str] = None
     actor_name: Optional[str] = None
-    image_id: Optional[str] = None
+    image_id: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{24}$")
 
 class MasterDataCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    image_id: Optional[str] = None
+    image_id: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{24}$")
 
 class BulkMasterDataItem(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    image_id: Optional[str] = None
+    image_id: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{24}$")
 
 class BulkMasterDataCreate(BaseModel):
     items: List[BulkMasterDataItem] = Field(..., min_items=1, max_items=100)
@@ -187,15 +192,30 @@ async def validate_master_field(field: str, value: Optional[str], collection):
         return value
     return value
 
+async def validate_actor_name(actor_name: Optional[str]):
+    if actor_name:
+        normalized_value = actor_name.strip().lower()
+        logger.info(f"Validating actor_name: {actor_name} (normalized: {normalized_value})")
+        actor = await actors_col.find_one({"name": {"$regex": f"^{normalized_value}$", "$options": "i"}})
+        if not actor:
+            logger.error(f"Actor not found for actor_name: {actor_name}")
+            raise ValueError(f"Invalid actor_name: {actor_name}. Must be one of the predefined actors.")
+        logger.info(f"Found actor: {actor['name']} with _id: {actor['_id']}")
+        return actor_name, actor["_id"]
+    return None, None
+
 async def validate_image_id(image_id: Optional[str]):
     if image_id:
         try:
             obj_id = ObjectId(image_id)
             image = await images_col.find_one({"_id": obj_id})
             if not image:
+                logger.error(f"Image not found for image_id: {image_id}")
                 raise ValueError(f"Invalid image_id: {image_id}")
+            logger.info(f"Validated image_id: {image_id}, file_path: {image['file_path']}")
             return image_id, image["file_path"]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Invalid image_id format: {image_id}, error: {str(e)}")
             raise ValueError(f"Invalid image_id format: {image_id}")
     return None, None
 
@@ -396,6 +416,33 @@ async def get_collection_all():
         "images": images_col
     }
 
+async def fix_actor_image_ids():
+    actors = await actors_col.find().to_list(length=1000)
+    for actor in actors:
+        image_id = actor.get("image_id")
+        if image_id:
+            try:
+                obj_id = ObjectId(image_id)
+                image = await images_col.find_one({"_id": obj_id})
+                if not image:
+                    logger.warning(f"Invalid image_id {image_id} for actor {actor['name']}, removing reference")
+                    await actors_col.update_one(
+                        {"_id": actor["_id"]},
+                        {"$unset": {"image_id": "", "image_path": ""}}
+                    )
+                elif image["file_path"] != actor.get("image_path"):
+                    logger.info(f"Fixing image_path for actor {actor['name']}")
+                    await actors_col.update_one(
+                        {"_id": actor["_id"]},
+                        {"$set": {"image_path": image["file_path"]}}
+                    )
+            except Exception:
+                logger.error(f"Invalid image_id format {image_id} for actor {actor['name']}")
+                await actors_col.update_one(
+                    {"_id": actor["_id"]},
+                    {"$unset": {"image_id": "", "image_path": ""}}
+                )
+
 # ------------------- AUTH -------------------
 @app.post("/register", response_model=dict, tags=["Auth"], dependencies=[Depends(verify_api_key)])
 async def register(user: UserRegister):
@@ -502,11 +549,13 @@ async def add_master_data(
         master_data["image_id"] = ObjectId(image_id)
         master_data["image_path"] = image_path
     elif image_id:
-        image_id, image_path = await validate_image_id(image_id)
-        if image_id:
-            master_data["image_id"] = ObjectId(image_id)
-            master_data["image_path"] = image_path
+        validated_image_id, image_path = await validate_image_id(image_id)
+        if not validated_image_id:
+            raise HTTPException(status_code=400, detail=f"Image with ID {image_id} not found")
+        master_data["image_id"] = ObjectId(validated_image_id)
+        master_data["image_path"] = image_path
     
+    logger.info(f"Storing master data for {collection}: name={name}, image_id={master_data.get('image_id')}, image_path={master_data.get('image_path')}")
     result = await col.insert_one(master_data)
     return {"msg": f"Added '{name}' to {collection}", "item_id": str(result.inserted_id), "success": True}
 
@@ -533,9 +582,12 @@ async def add_bulk_master_data(collection: str, bulk_data: BulkMasterDataCreate)
             master_data = {"name": item.name}
             if item.image_id:
                 image_id, image_path = await validate_image_id(item.image_id)
-                if image_id:
-                    master_data["image_id"] = ObjectId(image_id)
-                    master_data["image_path"] = image_path
+                if not image_id:
+                    failed_items.append({"item": item.name, "reason": f"Image with ID {item.image_id} not found"})
+                    continue
+                master_data["image_id"] = ObjectId(image_id)
+                master_data["image_path"] = image_path
+            logger.info(f"Storing bulk master data for {collection}: name={item.name}, image_id={master_data.get('image_id')}, image_path={master_data.get('image_path')}")
             await col.insert_one(master_data)
             inserted_count += 1
         except Exception as e:
@@ -701,12 +753,41 @@ async def play_music(music_id: str):
 
 # ------------------- IMAGES -------------------
 @app.post("/images", response_model=dict, tags=["Images"], dependencies=[Depends(verify_api_key), Depends(require_admin)])
-async def upload_image(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_image(
+    file: UploadFile = File(...),
+    actor_name: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user)
+):
+    # Log the incoming request
+    logger.info(f"Received image upload request with actor_name: {actor_name}")
+    
+    # Validate actor_name if provided
+    actor_name_validated, actor_id = await validate_actor_name(actor_name)
+    
+    # Save the uploaded image
     file_path, image_id = await save_uploaded_image(file, current_user)
+    
+    # If actor_name is provided, update the actor's image_id and image_path
+    if actor_name_validated and actor_id:
+        try:
+            result = await actors_col.update_one(
+                {"_id": actor_id},
+                {"$set": {"image_id": ObjectId(image_id), "image_path": file_path}}
+            )
+            if result.modified_count == 0:
+                logger.warning(f"No actor found or updated for actor_name: {actor_name_validated}, actor_id: {actor_id}")
+                raise HTTPException(status_code=404, detail=f"Failed to update actor {actor_name_validated}: Actor not found or no changes applied")
+            else:
+                logger.info(f"Successfully updated actor {actor_name_validated} (ID: {actor_id}) with image_id: {image_id}, image_path: {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to update actor {actor_name_validated} with image: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to update actor with image: {str(e)}")
+
     return {
         "msg": "Image uploaded successfully",
         "image_id": image_id,
         "file_path": file_path,
+        "actor_name": actor_name_validated,
         "success": True
     }
 
@@ -756,6 +837,7 @@ async def health_check():
 @app.on_event("startup")
 async def startup_event():
     await init_db()
+    await fix_actor_image_ids()
 
 @app.on_event("shutdown")
 async def shutdown_event():
